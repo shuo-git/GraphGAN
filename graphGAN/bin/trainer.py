@@ -26,15 +26,19 @@ def parse_args(args=None):
 def default_parameters():
     params = tf.contrib.training.HParams(
         data_dir="",
+        task="recommendation",
         emb_generator="gen.emb",
         emb_discriminator="dis.emb",
+        record="record",
         log_dir="",
         train_edges="train_edges.txt",
         test_edges="test_edges.txt",
+        test_neg_edges="test_neg_edges.txt",
         train_trees="train_trees.pkl",
         n_node=1000,
         graph={},
         s_nodes=set(),
+        e_nodes=set(),
         trees={},
         batch_size_gen=64,  # batch size for the generator
         batch_size_dis=64,  # batch size for the discriminator
@@ -85,24 +89,33 @@ def override_params(params, args):
 
     params.emb_generator = params.log_dir + '/' + params.emb_generator
     params.emb_discriminator = params.log_dir + '/' + params.emb_discriminator
+    params.record = params.log_dir + '/' + params.record
     params.train_edges = params.data_dir + '/' + params.train_edges
     params.test_edges = params.data_dir + '/' + params.test_edges
+    params.test_neg_edges = params.data_dir + '/' + params.test_neg_edges
     params.train_trees = params.data_dir + '/' + params.train_trees
     params.pretrain_emb_filename_d = params.data_dir + '/' + params.pretrain_emb_filename_d
     params.pretrain_emb_filename_g = params.data_dir + '/' + params.pretrain_emb_filename_g
 
-    params.n_node, params.graph, params.s_nodes = \
+    tf.logging.info("Reading edges...")
+    params.n_node, params.graph, params.s_nodes, params.e_nodes = \
         utils.read_edges(params.train_edges, params.test_edges)
 
+    if params.task != "recommendation":
+        params.s_nodes = params.s_nodes | params.e_nodes
+
     with open(params.train_trees, 'rb') as fr:
+        tf.logging.info("Loading BFS trees...")
         params.trees = pickle.load(fr)
 
     if os.path.isfile(params.pretrain_emb_filename_d):
+        tf.logging.info("Loading pre-trained discriminator embedding...")
         params.init_emb_d = utils.read_embeddings(params.pretrain_emb_filename_d, params.n_node, params.n_emb)
     else:
         params.init_emb_d = np.random.randn(params.n_node, params.n_emb) / float(params.n_emb)
 
     if os.path.isfile(params.pretrain_emb_filename_g):
+        tf.logging.info("Loading pre-trained generator embedding...")
         params.init_emb_g = utils.read_embeddings(params.pretrain_emb_filename_g, params.n_node, params.n_emb)
     else:
         params.init_emb_g = np.random.randn(params.n_node, params.n_emb) / float(params.n_emb)
@@ -121,6 +134,30 @@ def print_variables():
         v_size = np.prod(np.array(v.shape.as_list())).tolist()
         total_size += v_size
     tf.logging.info("Total trainable variables size: %d", total_size)
+
+
+def after_run(params, sess, model, g_score, d_score, best_acc, epoch, g_emb, d_emb):
+    gen_all_score_v = sess.run(g_score)
+    dis_all_score_v = sess.run(d_score)
+    if params.task == "recommendation":
+        gen_accuracy, gen_2 = model.eval_recommend(gen_all_score_v, params)
+        dis_accuracy, dis_2 = model.eval_recommend(dis_all_score_v, params)
+    elif params.task == "classification":
+        return 0.0
+    else:
+        gen_accuracy, gen_2 = model.eval_link_prediction(gen_all_score_v, params)
+        dis_accuracy, dis_2 = model.eval_link_prediction(dis_all_score_v, params)
+
+    if dis_accuracy > best_acc:
+        best_acc = dis_accuracy
+        utils.write_embeddings(params.emb_generator, sess.run(g_emb), params.n_node, params.n_emb)
+        utils.write_embeddings(params.emb_discriminator, sess.run(d_emb), params.n_node, params.n_emb)
+
+    with open(params.record, 'a+') as fw:
+        fw.write('gen\t{}\t{:.10f}\t{:.10f}\n'.format(epoch, gen_accuracy, gen_2))
+        fw.write('dis\t{}\t{:.10f}\t{:.10f}\n'.format(epoch, dis_accuracy, dis_2))
+
+    return best_acc
 
 
 def train(args):
@@ -163,14 +200,17 @@ def train(args):
     utils.write_embeddings(params.emb_generator, sess.run(gen_emb), params.n_node, params.n_emb)
     utils.write_embeddings(params.emb_discriminator, sess.run(dis_emb), params.n_node, params.n_emb)
 
-    gene_all_score = tf.matmul(dis_emb, dis_emb, transpose_b=True)
+    gene_all_score = tf.matmul(gen_emb, gen_emb, transpose_b=True)
     disc_all_score = tf.matmul(dis_emb, dis_emb, transpose_b=True)
 
     best_acc = 0.0
 
-    for epoch in range(params.n_epochs):
+    best_acc = after_run(params, sess, model, gene_all_score, disc_all_score,
+                         best_acc, 0, gen_emb, dis_emb)
+
+    for epoch in range(1, params.n_epochs+1):
         tf.logging.info("epoch %d" % epoch)
-        if (epoch+1) % params.save_steps == 0:
+        if epoch % params.save_steps == 0:
             saver.save(sess, params.log_dir + "/model-{}".format(epoch))
 
             # D-steps
@@ -178,6 +218,7 @@ def train(args):
             neighbor_nodes = []
             labels = []
             all_score_v = sess.run(gen_all_score)
+
             for d_epoch in tqdm.tqdm(range(params.n_epochs_dis)):
                 # generate new nodes for the discriminator for every dis_interval iterations
                 if d_epoch % params.dis_interval == 0:
@@ -212,20 +253,9 @@ def train(args):
                     sess.run(g_updates, feed_dict={node_id: np.array(node_1[start:end]),
                                                    node_neighbor_id: np.array(node_2[start:end]),
                                                    reward: np.array(reward_v[start:end])})
-
-        gen_all_score_v = sess.run(gene_all_score)
-        dis_all_score_v = sess.run(disc_all_score)
-        gen_accuracy, gen_recall = model.eval_recommend(gen_all_score_v, params)
-        dis_accuracy, dis_recall = model.eval_recommend(dis_all_score_v, params)
-
-        if dis_accuracy > best_acc:
-            best_acc = dis_accuracy
-            utils.write_embeddings(params.emb_generator, sess.run(gen_emb), params.n_node, params.n_emb)
-            utils.write_embeddings(params.emb_discriminator, sess.run(dis_emb), params.n_node, params.n_emb)
-
-        with open(params.record, 'a+') as fw:
-            fw.write('gen\t{}\t{:.10f}\t{:.10f}\n'.format(epoch, gen_accuracy, gen_recall))
-            fw.write('dis\t{}\t{:.10f}\t{:.10f}\n'.format(epoch, dis_accuracy, dis_recall))
+            # Evaluation
+            best_acc = after_run(params, sess, model, gene_all_score, disc_all_score,
+                                 best_acc, epoch, gen_emb, dis_emb)
 
 
 if __name__ == "__main__":

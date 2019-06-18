@@ -4,6 +4,7 @@ import numpy as np
 import tensorflow as tf
 import graphGAN.utils.common as utils
 import tqdm
+from sklearn.metrics import precision_score, f1_score
 
 
 def generator(params, inputs):
@@ -121,6 +122,29 @@ class GraphGAN(object):
 
         return accuracy_avg, recall_avg
 
+    @staticmethod
+    def eval_link_prediction(scores, params):
+        test_edges = utils.read_edges_from_file(params.test_edges)
+        test_neg_edges = utils.read_edges_from_file(params.test_neg_edges)
 
+        score_pred = []
+        for e in test_edges:
+            score_pred.append(scores[e[0]][e[1]])
 
+        for e in test_neg_edges:
+            score_pred.append(scores[e[0]][e[1]])
+
+        score_pred = np.array(score_pred)
+        median = np.median(score_pred)
+        index_pos = score_pred >= median
+        index_neg = score_pred < median
+        score_pred[index_pos] = 1
+        score_pred[index_neg] = 0
+        true_label = np.zeros(score_pred.shape)
+        true_label[0: len(true_label) // 2] = 1
+
+        acc = precision_score(true_label, score_pred, average='macro')
+        f1 = f1_score(true_label, score_pred, average='macro')
+
+        return acc, f1
 

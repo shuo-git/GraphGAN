@@ -26,7 +26,7 @@ def read_edges(train_filename, test_filename):
         if graph.get(edge[1]) is None:
             graph[edge[1]] = []
 
-    return max(max(s_nodes), max(e_nodes))+1, graph, s_nodes
+    return max(max(s_nodes), max(e_nodes))+1, graph, s_nodes, e_nodes
 
 
 def read_edges_from_file(filename):

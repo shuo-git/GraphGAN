@@ -36,6 +36,7 @@ def default_parameters():
         n_node=1000,
         graph={},
         s_nodes=set(),
+        e_nodes=set(),
         trees={},
         batch_size_gen=64,  # batch size for the generator
         batch_size_dis=64,  # batch size for the discriminator
@@ -93,7 +94,7 @@ def override_params(params, args):
     params.pretrain_emb_filename_d = params.data_dir + '/' + params.pretrain_emb_filename_d
     params.pretrain_emb_filename_g = params.data_dir + '/' + params.pretrain_emb_filename_g
 
-    params.n_node, params.graph, params.s_nodes = \
+    params.n_node, params.graph, params.s_nodes, params.e_nodes = \
         utils.read_edges(params.train_edges, params.test_edges)
 
     with open(params.train_trees, 'rb') as fr:
