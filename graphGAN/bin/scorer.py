@@ -26,12 +26,14 @@ def parse_args(args=None):
 def default_parameters():
     params = tf.contrib.training.HParams(
         data_dir="",
+        task="recommendation",
         emb_generator="gen.emb",
         emb_discriminator="dis.emb",
         record="record",
         log_dir="",
         train_edges="train_edges.txt",
         test_edges="test_edges.txt",
+        test_neg_edges="test_neg_edges.txt",
         train_trees="train_trees.pkl",
         n_node=1000,
         graph={},
@@ -57,8 +59,8 @@ def default_parameters():
         n_emb=50,
         top_k=10,
         max_to_save=100,
-        pretrain_emb_filename_d="pre_train.emb",
-        pretrain_emb_filename_g="pre_train.emb",
+        pretrain_emb_filename_d="baselines/node2vec.emb",
+        pretrain_emb_filename_g="baselines/struc2vec.emb",
         init_emb_d=np.array([0]),
         init_emb_g=np.array([0])
     )
@@ -90,22 +92,30 @@ def override_params(params, args):
     params.record = params.log_dir + '/' + params.record
     params.train_edges = params.data_dir + '/' + params.train_edges
     params.test_edges = params.data_dir + '/' + params.test_edges
+    params.test_neg_edges = params.data_dir + '/' + params.test_neg_edges
     params.train_trees = params.data_dir + '/' + params.train_trees
     params.pretrain_emb_filename_d = params.data_dir + '/' + params.pretrain_emb_filename_d
     params.pretrain_emb_filename_g = params.data_dir + '/' + params.pretrain_emb_filename_g
 
+    tf.logging.info("Reading edges...")
     params.n_node, params.graph, params.s_nodes, params.e_nodes = \
         utils.read_edges(params.train_edges, params.test_edges)
 
+    if params.task != "recommendation":
+        params.s_nodes = params.s_nodes | params.e_nodes
+
     with open(params.train_trees, 'rb') as fr:
+        tf.logging.info("Loading BFS trees...")
         params.trees = pickle.load(fr)
 
     if os.path.isfile(params.pretrain_emb_filename_d):
+        tf.logging.info("Loading pre-trained discriminator embedding...")
         params.init_emb_d = utils.read_embeddings(params.pretrain_emb_filename_d, params.n_node, params.n_emb)
     else:
         params.init_emb_d = np.random.randn(params.n_node, params.n_emb) / float(params.n_emb)
 
     if os.path.isfile(params.pretrain_emb_filename_g):
+        tf.logging.info("Loading pre-trained generator embedding...")
         params.init_emb_g = utils.read_embeddings(params.pretrain_emb_filename_g, params.n_node, params.n_emb)
     else:
         params.init_emb_g = np.random.randn(params.n_node, params.n_emb) / float(params.n_emb)
@@ -126,7 +136,33 @@ def print_variables():
     tf.logging.info("Total trainable variables size: %d", total_size)
 
 
-def eval(args):
+def after_run(params, sess, model, g_score, d_score, best_acc, epoch, g_emb, d_emb):
+    gen_all_score_v = sess.run(g_score)
+    dis_all_score_v = sess.run(d_score)
+    if params.task == "recommendation":
+        gen_accuracy, gen_2 = model.eval_recommend(gen_all_score_v, params)
+        dis_accuracy, dis_2 = model.eval_recommend(dis_all_score_v, params)
+    elif params.task == "classification":
+        utils.write_embeddings(params.emb_generator, sess.run(g_emb), params.n_node, params.n_emb)
+        utils.write_embeddings(params.emb_discriminator, sess.run(d_emb), params.n_node, params.n_emb)
+        return 0.0
+    else:
+        gen_accuracy, gen_2 = model.eval_link_prediction(gen_all_score_v, params)
+        dis_accuracy, dis_2 = model.eval_link_prediction(dis_all_score_v, params)
+
+    if dis_accuracy > best_acc:
+        best_acc = dis_accuracy
+        utils.write_embeddings(params.emb_generator, sess.run(g_emb), params.n_node, params.n_emb)
+        utils.write_embeddings(params.emb_discriminator, sess.run(d_emb), params.n_node, params.n_emb)
+
+    with open(params.record, 'a+') as fw:
+        fw.write('gen\t{}\t{:.10f}\t{:.10f}\n'.format(epoch, gen_accuracy, gen_2))
+        fw.write('dis\t{}\t{:.10f}\t{:.10f}\n'.format(epoch, dis_accuracy, dis_2))
+
+    return best_acc
+
+
+def train(args):
     tf.logging.set_verbosity(tf.logging.INFO)
     params = default_parameters()
     params = import_params(args.log_dir, params)
@@ -140,11 +176,9 @@ def eval(args):
     label = tf.placeholder(tf.float32, shape=[None])
 
     tf.logging.info("Building generator...")
-    _, _, gen_emb = model.build_generator(params, [node_id, node_neighbor_id, reward])
-    gen_all_score = tf.matmul(gen_emb, gen_emb, transpose_b=True)
+    gen_all_score, gen_loss, gen_emb = model.build_generator(params, [node_id, node_neighbor_id, reward])
     tf.logging.info("Building discriminator...")
-    _, _, dis_emb = model.build_discriminator(params, [node_id, node_neighbor_id, label])
-    dis_all_score = tf.matmul(dis_emb, dis_emb, transpose_b=True)
+    dis_reward, dis_loss, dis_emb = model.build_discriminator(params, [node_id, node_neighbor_id, label])
 
     print_variables()
 
@@ -156,21 +190,22 @@ def eval(args):
     sess = tf.Session(config=sess_config)
     sess.run(init_op)
 
-    with open(params.record, 'a+') as fw:
-        fw.write('model\tepoch\tprecision\trecall\n')
-        for epoch in range(params.n_epochs):
-            model_checkpoint_path = params.log_dir + '/' + 'model-%d' % epoch
-            tf.logging.info("loading the checkpoint: %s" % model_checkpoint_path)
-            saver.restore(sess, model_checkpoint_path)
-            gen_all_score_v = sess.run(gen_all_score)
-            dis_all_score_v = sess.run(dis_all_score)
+    checkpoint = tf.train.get_checkpoint_state(params.log_dir)
+    if checkpoint and checkpoint.model_checkpoint_path:
+        tf.logging.info("loading the checkpoint: %s" % checkpoint.model_checkpoint_path)
+        saver.restore(sess, checkpoint.model_checkpoint_path)
 
-            gen_accuracy, gen_recall = model.eval_recommend(gen_all_score_v, params)
-            dis_accuracy, dis_recall = model.eval_recommend(dis_all_score_v, params)
+    utils.write_embeddings(params.emb_generator, sess.run(gen_emb), params.n_node, params.n_emb)
+    utils.write_embeddings(params.emb_discriminator, sess.run(dis_emb), params.n_node, params.n_emb)
 
-            fw.write('gen\t{}\t{:.10f}\t{:.10f}\n'.format(epoch, gen_accuracy, gen_recall))
-            fw.write('dis\t{}\t{:.10f}\t{:.10f}\n'.format(epoch, dis_accuracy, dis_recall))
+    gene_all_score = tf.matmul(gen_emb, gen_emb, transpose_b=True)
+    disc_all_score = tf.matmul(dis_emb, dis_emb, transpose_b=True)
+
+    best_acc = 0.0
+
+    after_run(params, sess, model, gene_all_score, disc_all_score,
+              best_acc, 0, gen_emb, dis_emb)
 
 
 if __name__ == "__main__":
-    eval(parse_args())
+    train(parse_args())

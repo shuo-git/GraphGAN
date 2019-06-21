@@ -4,6 +4,5 @@
 *.data-00000-of-00001
 *.index
 *.meta
-data/Wikipedia
-data/CA-AstroPh/*
-data/CA-GrQc/*
+data/*
+exp/*

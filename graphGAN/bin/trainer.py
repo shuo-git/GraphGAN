@@ -143,6 +143,8 @@ def after_run(params, sess, model, g_score, d_score, best_acc, epoch, g_emb, d_e
         gen_accuracy, gen_2 = model.eval_recommend(gen_all_score_v, params)
         dis_accuracy, dis_2 = model.eval_recommend(dis_all_score_v, params)
     elif params.task == "classification":
+        utils.write_embeddings(params.emb_generator, sess.run(g_emb), params.n_node, params.n_emb)
+        utils.write_embeddings(params.emb_discriminator, sess.run(d_emb), params.n_node, params.n_emb)
         return 0.0
     else:
         gen_accuracy, gen_2 = model.eval_link_prediction(gen_all_score_v, params)
